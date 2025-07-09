@@ -1,2 +1,2 @@
 # cnpj_terciario_intensidade_conhecimento
-Projeto associado ao Curso de Análise de Dados e Geoespacial com R do INCT Labplan voltado ao Eixo 1. Foi feito um procedimento para pegar os dados diretamente da base de dados do CNPJ, tratar e classificar conforme a metodologia do terciário por intensidade de conhecimento
+Projeto associado ao Curso de Análise de Dados e Geoespacial com R do INCT Labplan voltado ao Eixo 1.O foco desse projeto foi realizar um procedimento para ler os dados diretamente da base de dados do CNPJ, contar a quantidade de estabelecimentos por municipio em cada categoria e espacializar em um mapa. A metodologia de tratamento dos dados pode ser adaptada para outras escalas e outros setores/classificações.
