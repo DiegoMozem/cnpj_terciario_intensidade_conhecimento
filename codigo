@@ -1,0 +1,1507 @@
+# Projeto Final: Análise do Terciário por Intensidade de Conhecimento
+# Autor: Diego Mozem Minatogawa (UFABC/LEPUR) - Eixo 1
+# Data: Junho de 2025
+
+#Sumário
+#1. Introdução e breve contextualização da pesquisa                  - L.28 - 37
+#2. Pacotes                                                          - L.40 - 56
+#3. Variáveis, colunas, dados geoespaciais e caminhos                - L 59 -112
+#4. Processando arquivos de estabelecimento                          - L.115-211
+#5. Consolidando os arquivos estabelecimento em Parquet              - L.214-235
+#6. Join entre estabelecimentos e informações geoespaciais           - L.238-298
+#7. Carregando a CNAE                                                - L.301-338
+#8. O terciário por intensidade de conhecimento                      - L.340-471
+#9. Agrupando dados e gerando mapas                                  - L.473-1393
+    #9.1.Serviços de mercado intensivos em conhecimento              - L.477-627
+    #9.2.Serviços de conhecimento de alta tecnologia                 - L.630-752
+    #9.3.Serviços financeiros intensivos em conhecimento             - L.754-878
+    #9.4.Serviços intensivos em conhecimento administração pública...- L.880-1004
+    #9.5.Serviços mercado menos intensivos em conhecimento: comércio - L.1007-1130
+    #9.6.Serviços mercado menos intensivos em conhecimento: diversos - L.1133-1258
+    #9.7.Demais serviços menos intensivos em conhecimento            - L.1260-1392
+##10.Conclusões                                                      - L.1395-1427
+#Referências                                                         - L.1430-1441
+
+#Apêndice A                                                          - L.1444-1470
+#Apêndice B                                                          - L.1473-1507
+
+#===============================================================================
+#1. Introdução e breve contextualização da pesquisa
+#===============================================================================
+#   O setor terciário apresenta elevada heterogeneidade e um papel pouco explorado
+#nos estudos referentes ao desenvolvimento econômico. Nesse sentido, essa pesquisa
+#utiliza a metodologia de classificação do setor terciário por intensidade de 
+#conhecimento a partir da CNAE para permitir uma melhor interpretação desse setor
+#a partir de uma classificação que categoriza esses setores.
+#   Portanto, utilizar a base de dados do CNPJ para
+#observar a espacialização desse setor será útil para compreender como esse setor
+#se manifesta e, portanto, compreender as economias regionais como um todo
+
+#===============================================================================
+#2. Pacotes
+#===============================================================================
+
+library(colorspace)
+library(viridis)
+library(data.table)  # Para fread
+library(dplyr)       # Para manipulação de dados (mutate, %>%), across, na_if, if_else
+library(stringr)     # Para str_trim, str_remove_all, str_to_lower, str_replace_all
+library(arrow)       # Para open_dataset, write_dataset, arrow::cast, write_parquet
+library(lubridate)   # Para ymd
+library(sf)          # Para dados espaciais (usado por geobr)
+library(geobr)       # Para dados geográficos de municípios
+library(stringi)     # Para stri_trans_general (remoção de acentos)
+library(ggplot2)
+library(paletteer)
+library(ggspatial)
+library(readr)
+
+#===============================================================================
+#3. Variáveis, colunas, dados geoespaciais e caminhos
+#===============================================================================
+#Definindo caminhos base (onde estão os arquivos e para onde irão os parquets e mapas)
+base_dir <- "C:/cnpj/"
+setwd(base_dir) # Opcional: define o diretório de trabalho, mas é melhor usar caminhos absolutos ou relativos ao script
+
+#NAs comuns (para tratamento posterior)
+na_strings_comuns <- c("", "NA", " ", "\t", "N/A", "null", "NULL")
+
+
+#Definir Nomes de Colunas e Tipos para 'estabelecimento'
+coluna_estabele <- c(
+  "cnpj_basico", "cnpj_ordem", "cnpj_dv", "matriz_filial", "nome_fantasia",
+  "situacao_cadastral", "data_situacao_cadastral", "motivo_situacao_cadastral",
+  "nome_pais_exterior", "pais", "data_inicio", "cnae_primaria",
+  "cnae_secundaria", "tipo_logradouro", "logradouro", "numero",
+  "complemento", "bairro", "cep", "uf", "municipio",
+  "ddd_1", "telefone_1", "ddd_2", "telefone_2", "ddd_fax",
+  "fax", "email", "situacao_especial", "data_situacao_especial"
+)
+tipos_estabele_na_leitura <- rep("character", length(coluna_estabele))
+names(tipos_estabele_na_leitura) <- coluna_estabele
+
+colunas_para_selecionar_estabele <- c( #colunas para select
+  "cnpj_basico", "cnpj_ordem", "cnpj_dv", "matriz_filial",
+  "nome_fantasia",
+  "situacao_cadastral", "data_situacao_cadastral", "data_inicio",
+  "cnae_primaria", "cnae_secundaria", "tipo_logradouro", "logradouro",
+  "numero", "bairro", "cep", "uf", "municipio"
+)
+colunas_int_estabele <- c( #colunas em formato int
+  "cnpj_ordem", "cnpj_dv", "matriz_filial", "situacao_cadastral",
+  "cnae_primaria", "cnae_secundaria", "municipio"
+)
+
+colunas_texto_normalizar_estabele <- c( #colunas que será necessário tratar o texto
+  "nome_fantasia", "tipo_logradouro", "logradouro", "bairro", "uf"
+)
+
+#Definir Nomes de Colunas e Tipos para 'Município'
+coluna_muni_cnpj <- c("codigo_municipio", "nome_municipio")
+tipos_muni_cnpj_na_leitura <- c(codigo_municipio = "character", nome_municipio = "character")
+
+#Definir Nomes de Colunas e Tipos para a Classificação Nacional de Atividades Econômicas (CNAE)
+coluna_cnae <- c("codigo", "atividade_economica")
+tipos_cnae_na_leitura <- c(codigo = "character", atividade_economica = "character")
+
+#Carregando os municipios de 2024 (georreferenciado)
+municipios_2022 <- geobr::read_municipality(year = 2024)
+municipios_2022 <- sf::st_make_valid(municipios_2022)
+
+#Carregando os dados das UFs (Estados)
+uf_br <- geobr::read_state(year = 2020)
+uf_br <- sf::st_make_valid(uf_br)
+
+#===============================================================================
+#4. Processando arquivos de estabelecimento
+#===============================================================================
+
+#tipo do arquivo
+tipos_estabele_na_leitura_para_fread <- rep("character", length(coluna_estabele))
+
+#caminho do arquivo em looping
+arquivos_estabele_csv <- paste0(base_dir, "K3241.K03200Y", 0:9, ".D50510.ESTABELE")
+for (i in 1:length(arquivos_estabele_csv)) {
+  file_csv_path <- arquivos_estabele_csv[i]
+  # Define o caminho de saída para o arquivo Parquet correspondente
+  output_parquet_path <- paste0(base_dir, "estabelecimento", i-1, ".parquet")
+  
+  # Bloco tryCatch para gerenciar erros e continuar o processamento mesmo que um arquivo falhe
+  tryCatch({
+    # 1. Leitura do arquivo CSV usando `fread`
+    # As colunas são lidas como 'character' para facilitar as operações de limpeza.
+    df_estabele_ram <- fread(
+      file_csv_path,
+      sep = ";",
+      header = FALSE, # Indica que o arquivo não tem linha de cabeçalho
+      col.names = coluna_estabele, # Nomes a serem atribuídos às colunas
+      encoding = "Latin-1", # Codificação do arquivo CSV
+      na.strings = na_strings_comuns, # Strings a serem tratadas como NA
+      colClasses = tipos_estabele_na_leitura_para_fread # Tipos de coluna definidos (todos character)
+    )
+    
+    # 2. Seleção das colunas desejadas
+    # Mantém apenas as colunas especificadas em 'colunas_para_selecionar_estabele'.
+    df_estabele_ram <- df_estabele_ram %>%
+      dplyr::select(all_of(colunas_para_selecionar_estabele))
+    
+    # Atualiza a lista de colunas para limpeza básica após a seleção,
+    # garantindo que apenas as colunas existentes sejam processadas.
+    colunas_para_limpeza_basica_estabele <- names(df_estabele_ram)
+    
+    # 3. Etapas de Limpeza e Padronização de Texto (str_trim e substituição de NA)
+    df_estabele_ram <- df_estabele_ram %>%
+      dplyr::mutate(
+        # Remove espaços em branco (leading/trailing) de todas as colunas de texto/número
+        across(
+          .cols = all_of(colunas_para_limpeza_basica_estabele),
+          .fns = ~ str_trim(.x)
+        ),
+        # Converte strings específicas (definidas em `na_strings_comuns`) para NA
+        across(
+          .cols = all_of(colunas_para_limpeza_basica_estabele),
+          .fns = ~ dplyr::if_else(.x %in% na_strings_comuns, NA_character_, .x)
+        )
+      ) %>%
+      # 4. Etapas de Limpeza Específica e Conversão de Tipos
+      dplyr::mutate(
+        # Limpa a coluna 'cnpj_basico', removendo todos os caracteres não-numéricos
+        cnpj_basico = stringr::str_remove_all(cnpj_basico, "[^0-9]"),
+        
+        # Converte as colunas especificadas para inteiro
+        # Primeiro, remove caracteres não-numéricos, depois converte para integer.
+        across(
+          .cols = all_of(colunas_int_estabele),
+          .fns = ~ {
+            cleaned_val <- stringr::str_remove_all(.x, "[^0-9]")
+            as.integer(cleaned_val)
+          }
+        ),
+        
+        # Converte colunas de data para o formato de data do R (`YYYY-MM-DD`).
+        data_situacao_cadastral = lubridate::ymd(data_situacao_cadastral),
+        data_inicio = lubridate::ymd(data_inicio),
+        
+        # Normaliza colunas de texto:
+        # Remove acentos, converte para minúsculas, substitui não-alfanuméricos por underscores,
+        # e limpa underscores extras (múltiplos ou nas bordas).
+        across(
+          .cols = all_of(colunas_texto_normalizar_estabele),
+          .fns = ~ .x %>%
+            iconv(from = "UTF-8", to = "ASCII//TRANSLIT") %>% # Remove acentos e translitera
+            stringr::str_to_lower() %>% # Converte para minúsculas
+            stringr::str_replace_all("[^a-z0-9]", "_") %>% # Substitui tudo que não é letra/número por underscore
+            stringr::str_replace_all("_{2,}", "_") %>% # Reduz múltiplos underscores para um único
+            stringr::str_remove_all("^_|_$") # Remove underscores no início ou fim
+        )
+      )
+    
+    # 5. Escrita do arquivo Parquet e Gerenciamento de Memória
+    # Salva o dataframe limpo no formato Parquet, que é eficiente para armazenamento e leitura.
+    arrow::write_parquet(df_estabele_ram, output_parquet_path)
+    # Remove o dataframe da memória RAM para liberar espaço, importante para grandes volumes de dados.
+    rm(df_estabele_ram)
+    # Força a coleta de lixo, liberando ainda mais memória.
+    gc()
+    
+  }, error = function(e) {
+    # Captura e exibe mensagens de erro para cada arquivo que falha,
+    # permitindo que o loop continue para os próximos arquivos.
+    message(paste("Erro ao processar estabelecimento CSV:", file_csv_path, ":", e$message))
+  })
+}
+
+#===============================================================================
+#5. Consolidando os arquivos estabelecimento em Parquet (para reduzir o uso da memória)
+#===============================================================================
+
+#Cria o caminho para os 9 arquivos
+parquet_caminhos_estabele <- paste0(base_dir, "estabelecimento", 0:9, ".parquet")
+
+#Abre o novo dataset com todos os dados
+estabelecimento_dataset_virtual <- arrow::open_dataset(parquet_caminhos_estabele)
+
+#Cria o caminho para um arquivo parquet com todos os arquivos
+caminho_estabele_consolidado <- paste0(base_dir, "estabelecimento_total_consolidado.parquet")
+
+#Consolida um arquivo único com todas as informações na memória
+arrow::write_dataset(
+  dataset = estabelecimento_dataset_virtual,
+  path = caminho_estabele_consolidado,
+  format = "parquet",
+  partitioning = NULL
+)
+
+#Abre a variável estabelecimento, com todas as informações necessárias
+estabelecimento <- arrow::open_dataset(caminho_estabele_consolidado)
+
+#===============================================================================
+#6. Join entre estabelecimentos e informações geoespaciais
+#===============================================================================
+
+#Como a receita federal usa um sistema próprio de código municipal, essa etapa
+#busca adaptar esse sistema ao sistema padronizado do IBGE para criar os mapeamentos.
+#Assim, no Anexo A estará o código em SQL que foi utilizado para criar uma tabela
+#a partir da Base dos Dados para converter o sistema da RF para o sistema padrão.
+# A informação foi salva na tabela "municipios_code_tratados.csv".
+
+
+municipios_tratamento <- readr::read_csv("municipios_code_tratados.csv",
+                                         col_types = readr::cols(
+                                           id_municipio_rf = readr::col_character(),
+                                           id_municipio = readr::col_character()
+                                         ))
+
+#Preparando o join
+estabelecimento <- estabelecimento %>% 
+  mutate(municipio = as.character(municipio))
+
+#Realizando o join entre estabelecimento e município e criando "codigo_ibge"
+estabelecimento <- estabelecimento %>%
+  left_join(municipios_tratamento, by = c("municipio" = "id_municipio_rf")) %>%
+  mutate(codigo_ibge = id_municipio) %>% # Cria a nova coluna 'codigo_ibge'
+  select(-id_municipio, -cnpj, -id_municipio_nome)
+
+#Salvando o dataset de estabelecimentos com o código IBGE
+caminho_estabele_com_ibge_code <- paste0(base_dir, "estabelecimento_com_ibge_code.parquet")
+arrow::write_dataset(
+  estabelecimento,
+  path = caminho_estabele_com_ibge_code,
+  format = "parquet",
+  partitioning = NULL
+)
+
+#Reabrindo o dataset 'estabelecimento' para que ele seja a versão com 'code_muni'
+estabelecimento <- arrow::open_dataset(caminho_estabele_com_ibge_code)
+x <- estabelecimento %>%
+  head() %>%
+  collect()
+
+#verificando os dados
+primeiras_linhas <- estabelecimento %>%
+  head() %>%
+  collect()
+View(primeiras_linhas)
+
+#Filtrando estabelecimentos ativos (05/2025)
+estabelecimento_ativos <- estabelecimento %>%
+  dplyr::filter(situacao_cadastral == 2)
+
+#Criando o arquivo de estabelecimentos ativos
+caminho_estabele_ativos <- paste0(base_dir, "estabelecimento_ativos.parquet")
+arrow::write_dataset(
+  estabelecimento,
+  path = caminho_estabele_ativos,
+  format = "parquet",
+  partitioning = NULL
+)
+
+estabelecimento_ativos <- arrow::open_dataset(caminho_estabele_ativos)
+
+#===============================================================================
+#7. Carregando a CNAE
+#===============================================================================
+
+#Caminho para a leitura do arquivo
+file_path_cnae_csv <- paste0(base_dir, "F.K03200$Z.D50510.CNAECSV")
+
+tryCatch({
+  cnae <- fread( #Carrega o arquivo
+    file_path_cnae_csv,
+    sep = ";",
+    header = FALSE,
+    col.names = coluna_cnae,
+    encoding = "Latin-1",
+    colClasses = "character"
+  )
+  
+  cnae <- cnae %>%
+    dplyr::mutate(
+      across(.cols = everything(), .fns = ~ str_trim(as.character(.x))), #remove espaços e garante a conversão em character
+      across(.cols = everything(), .fns = ~ if_else(.x %in% na_strings_comuns, NA_character_, .x)) #converte o inexistente em NA
+    )
+  
+  cnae <- cnae %>%
+    dplyr::mutate(
+      
+      atividade_economica = stringi::stri_trans_general(atividade_economica, "Latin-ASCII"), #remove acentos e normaliza characteres
+      atividade_economica = stringr::str_to_lower(atividade_economica), #coloca tudo em minúsculo
+      atividade_economica = stringr::str_replace_all(atividade_economica, "\\s+", "_"), #substitui um ou mais espaços por "_"
+      atividade_economica = stringr::str_replace_all(atividade_economica, "[^a-z0-9_]", ""), #remove os characteres que não são letras ou números ou "_"
+      atividade_economica = stringr::str_replace_all(atividade_economica, "_{2,}", "_"), #reduz multiplos sublinhados para apenas um
+      atividade_economica = stringr::str_remove_all(atividade_economica, "^_|_$"), #remove sublinhados no início ou final
+      
+      codigo = as.integer(codigo) # Converte 'codigo' para integer
+    )
+  
+}, error = function(e) { #Avisa se deu erro
+  message(paste("ERRO ao carregar/limpar CNAE CSV:", e$message))
+})
+
+#===============================================================================
+#8. O terciário por intensidade de conhecimento
+#===============================================================================
+
+#Serviços de mercado intensivos em conhecimento: Serviço de transporte aquático e aéreo e Serviços técnico-profissionais
+#Serviços intensivos em conhecimento de alta tecnologia: Atividades audiovisual e de telecomunicações, Pesquisa e desenvolvimento científico, Serviços de TI e Atividades de rádio e televisão
+#Serviços financeiros intensivos em conhecimento: Serviços Financeiros
+#Serviços intensivos em conhecimento administração pública, saúde, educação e outros: Administração pública, Educação, Serviços de saúde e assistência social, Serviços de edição (exceto de música), Atividades artísticas, culturais, esportivas e de recreação e Atividades veterinárias
+#Serviços de mercado menos intensivos em conhecimento: comércio: Comércio e reparação de automóveis, Comércio tradicional, Comércio moderno, Comércio de bens produtivos e de combustíveis, Comércio ambulante e Outros Comércios
+#Serviços de mercado menos intensivos em conhecimento: diversos: Serviço de transporte terrestre, Alojamento e alimentação, Atividades imobiliárias, Serviços de apoio administrativo, Agenciamento de emprego, vigilância, segurança e investigação e Atividades complementares aos domicílios
+#Demais serviços menos intensivos em conhecimento: Serviços de entrega, Organizações associativas e organismos internacionais, Outras atividades de serviços pessoais e Serviços Domésticos.
+
+#Filtros usando códigos
+
+#Serviços de mercado intensivos em conhecimento
+servicos_mercado_intensivos_conhecimento <- cnae %>%
+  dplyr::filter(
+    # Converte 'codigo' para caractere para ambas as verificações
+    (stringr::str_starts(as.character(codigo), "51") | # TRANSPORTE AÉREO
+       stringr::str_starts(as.character(codigo), "523") | # Atividades auxiliares dos transportes aquaviários
+       stringr::str_starts(as.character(codigo), "524") | #Atividades auxiliares dos transportes aéreos
+       stringr::str_starts(as.character(codigo), "69") | # ATIVIDADES JURÍDICAS, DE CONTABILIDADE E DE AUDITORIA
+       stringr::str_starts(as.character(codigo), "70") | # ATIVIDADES DE SEDES DE EMPRESAS E DE CONSULTORIA EM GESTÃO EMPRESARIAL
+       stringr::str_starts(as.character(codigo), "71") | #SERVIÇOS DE ARQUITETURA E ENGENHARIA; TESTES E ANÁLISES TÉCNICAS
+       stringr::str_starts(as.character(codigo), "73") | #PUBLICIDADE E PESQUISA DE MERCADO
+       stringr::str_starts(as.character(codigo), "74") | # OUTRAS ATIVIDADES PROFISSIONAIS, CIENTÍFICAS E TÉCNICAS
+       stringr::str_starts(as.character(codigo), "50")) & #TRANSPORTE AQUAVIÁRIO
+      (nchar(as.character(codigo)) == 7)# pega apenas códigos com exatamente 7 characteres (pois existem códigos que iniciam com o mesmo número e com menos dígitos)                   
+  )
+
+#Serviços intensivos em conhecimento de alta tecnologia
+servicos_conhecimento_alta_tecnologia <- cnae %>%
+  dplyr::filter(
+    # Converte 'codigo' para caractere para ambas as verificações
+    (stringr::str_starts(as.character(codigo), "60") | # ATIVIDADES DE RÁDIO E DE TELEVISÃO
+       stringr::str_starts(as.character(codigo), "61") | #TELECOMUNICAÇÕES
+       stringr::str_starts(as.character(codigo), "62") | #ATIVIDADES DOS SERVIÇOS DE TECNOLOGIA DA INFORMAÇÃO
+       stringr::str_starts(as.character(codigo), "63") | #ATIVIDADES DE PRESTAÇÃO DE SERVIÇOS DE INFORMAÇÃO
+       stringr::str_starts(as.character(codigo), "72") | #PESQUISA E DESENVOLVIMENTO CIENTÍFICO
+       stringr::str_starts(as.character(codigo), "95") | #REPARAÇÃO E MANUTENÇÃO DE EQUIPAMENTOS DE INFORMÁTICA E COMUNICAÇÃO E DE OBJETOS PESSOAIS E DOMÉSTICOS
+       stringr::str_starts(as.character(codigo), "59")) & #ATIVIDADES CINEMATOGRÁFICAS, PRODUÇÃO DE VÍDEOS E DE PROGRAMAS DE TELEVISÃO; GRAVAÇÃO DE SOM E EDIÇÃO DE MÚSICA
+      (nchar(as.character(codigo)) == 7) 
+  )
+
+#Serviços financeiros intensivos em conhecimento
+servicos_financeiro_conhecimento <- cnae %>%
+  dplyr::filter(
+    # Converte 'codigo' para caractere para ambas as verificações
+    (stringr::str_starts(as.character(codigo), "65") | #SEGUROS, RESSEGUROS, PREVIDÊNCIA COMPLEMENTAR E PLANOS DE SAÚDE
+       stringr::str_starts(as.character(codigo), "66") | #ATIVIDADES AUXILIARES DOS SERVIÇOS FINANCEIROS, SEGUROS, PREVIDÊNCIA COMPLEMENTAR E PLANOS DE SAÚDE
+       stringr::str_starts(as.character(codigo), "77") | #ALUGUÉIS NÃO-IMOBILIÁRIOS E GESTÃO DE ATIVOS INTANGÍVEIS NÃO-FINANCEIROS
+       stringr::str_starts(as.character(codigo), "64")) & #ATIVIDADES DE SERVIÇOS FINANCEIROS
+      (nchar(as.character(codigo)) == 7)                   
+  )
+
+
+#Serviços intensivos em conhecimento administração pública, saúde, educação e outros
+servicos_administracao_conhecimento <- cnae %>%
+  dplyr::filter(
+    # Converte 'codigo' para caractere para ambas as verificações
+    (stringr::str_starts(as.character(codigo), "58") | #EDIÇÃO E EDIÇÃO INTEGRADA À IMPRESSÃO
+       stringr::str_starts(as.character(codigo), "75") | #ATIVIDADES VETERINÁRIAS
+       stringr::str_starts(as.character(codigo), "84") | #ADMINISTRAÇÃO PÚBLICA, DEFESA E SEGURIDADE SOCIAL
+       stringr::str_starts(as.character(codigo), "85") | #EDUCAÇÃO
+       stringr::str_starts(as.character(codigo), "86") | # ATIVIDADES DE ATENÇÃO À SAÚDE HUMANA
+       stringr::str_starts(as.character(codigo), "88") | # SERVIÇOS DE ASSISTÊNCIA SOCIAL SEM ALOJAMENTO
+       stringr::str_starts(as.character(codigo), "90") | #ATIVIDADES ARTÍSTICAS, CRIATIVAS E DE ESPETÁCULOS
+       stringr::str_starts(as.character(codigo), "91") | #ATIVIDADES LIGADAS AO PATRIMÔNIO CULTURAL E AMBIENTAL
+       stringr::str_starts(as.character(codigo), "92") | #ATIVIDADES DE EXPLORAÇÃO DE JOGOS DE AZAR E APOSTAS
+       stringr::str_starts(as.character(codigo), "93") | #ATIVIDADES ESPORTIVAS E DE RECREAÇÃO E LAZER
+       stringr::str_starts(as.character(codigo), "87")) & #ATIVIDADES DE ATENÇÃO À SAÚDE HUMANA INTEGRADAS COM ASSISTÊNCIA SOCIAL, PRESTADAS EM RESIDÊNCIAS COLETIVAS E PARTICULARES
+      (nchar(as.character(codigo)) == 7))   
+
+#Serviços de mercado menos intensivos em conhecimento: comércio
+servicos_mercado_menos <- cnae %>%
+  dplyr::filter(
+    # Converte 'codigo' para caractere para ambas as verificações
+    (stringr::str_starts(as.character(codigo), "45") | # COMÉRCIO E REPARAÇÃO DE VEÍCULOS AUTOMOTORES E MOTOCICLETAS
+       stringr::str_starts(as.character(codigo), "46") | # COMÉRCIO POR ATACADO, EXCETO VEÍCULOS AUTOMOTORES E MOTOCICLETAS
+       stringr::str_starts(as.character(codigo), "47")) & #COMÉRCIO VAREJISTA
+      (nchar(as.character(codigo)) == 7)                  
+  )
+
+#Serviços de mercado menos intensivos em conhecimento: diversos
+servicos_diversos_menos <- cnae %>%
+  dplyr::filter(
+    # Converte 'codigo' para caractere para ambas as verificações
+    (stringr::str_starts(as.character(codigo), "522") | #Atividades auxiliares dos transportes terrestres
+       stringr::str_starts(as.character(codigo), "55") | #ALOJAMENTO
+       stringr::str_starts(as.character(codigo), "56") | #ALIMENTAÇÃO
+       stringr::str_starts(as.character(codigo), "68") | #ATIVIDADES IMOBILIÁRIAS
+       stringr::str_starts(as.character(codigo), "78") | #SELEÇÃO, AGENCIAMENTO E LOCAÇÃO DE MÃO-DE-OBRA
+       stringr::str_starts(as.character(codigo), "79") | #AGÊNCIAS DE VIAGENS, OPERADORES TURÍSTICOS E SERVIÇOS DE RESERVAS
+       stringr::str_starts(as.character(codigo), "80") | #ATIVIDADES DE VIGILÂNCIA, SEGURANÇA E INVESTIGAÇÃO
+       stringr::str_starts(as.character(codigo), "81") | #SERVIÇOS PARA EDIFÍCIOS E ATIVIDADES PAISAGÍSTICAS
+       stringr::str_starts(as.character(codigo), "82") | #SERVIÇOS DE ESCRITÓRIO, DE APOIO ADMINISTRATIVO E OUTROS SERVIÇOS PRESTADOS PRINCIPALMENTE ÀS EMPRESAS
+       stringr::str_starts(as.character(codigo), "49")) & #TRANSPORTE TERRESTRE
+      (nchar(as.character(codigo)) == 7) 
+  )
+
+#Demais serviços menos intensivos em conhecimento
+servicos_demais_menos <- cnae %>%
+  dplyr::filter(
+    # Converte 'codigo' para caractere para ambas as verificações
+    (stringr::str_starts(as.character(codigo), "53") | #CORREIO E OUTRAS ATIVIDADES DE ENTREGA
+       stringr::str_starts(as.character(codigo), "94") | #ATIVIDADES DE ORGANIZAÇÕES ASSOCIATIVAS
+       stringr::str_starts(as.character(codigo), "96") | # OUTRAS ATIVIDADES DE SERVIÇOS PESSOAIS
+       stringr::str_starts(as.character(codigo), "525") | #Atividades relacionadas à organização do transporte de carga
+       stringr::str_starts(as.character(codigo), "97") | #SERVIÇOS DOMÉSTICOS
+       stringr::str_starts(as.character(codigo), "99") | #ORGANISMOS INTERNACIONAIS E OUTRAS INSTITUIÇÕES EXTRATERRITORIAIS
+       stringr::str_starts(as.character(codigo), "521")) & #Armazenamento, carga e descarga
+      (nchar(as.character(codigo)) == 7) 
+  )
+
+#Salvando cada categoria em um arquivo parquet (para eficiência em joins)
+dir.create(paste0(base_dir, "cnae_categorias_parquet"), showWarnings = FALSE)
+
+save_cnae_category_to_parquet <- function(df_category, category_name) {
+  output_path <- paste0(base_dir, "cnae_categorias_parquet/", category_name, ".parquet")
+  arrow::write_parquet(df_category, output_path)
+  return(arrow::open_dataset(output_path)) # Retorna o dataset Arrow para uso futuro
+}
+
+# Converte e salva cada categoria para um dataset Arrow
+servicos_mercado_intensivos_conhecimento_ds <- save_cnae_category_to_parquet(servicos_mercado_intensivos_conhecimento, "servicos_mercado_intensivos_conhecimento")
+servicos_conhecimento_alta_tecnologia_ds <- save_cnae_category_to_parquet(servicos_conhecimento_alta_tecnologia, "servicos_conhecimento_alta_tecnologia")
+servicos_financeiro_conhecimento_ds <- save_cnae_category_to_parquet(servicos_financeiro_conhecimento, "servicos_financeiro_conhecimento")
+servicos_administracao_conhecimento_ds <- save_cnae_category_to_parquet(servicos_administracao_conhecimento, "servicos_administracao_conhecimento")
+servicos_mercado_menos_ds <- save_cnae_category_to_parquet(servicos_mercado_menos, "servicos_mercado_menos")
+servicos_diversos_menos_ds <- save_cnae_category_to_parquet(servicos_diversos_menos, "servicos_diversos_menos")
+servicos_demais_menos_ds <- save_cnae_category_to_parquet(servicos_demais_menos, "servicos_demais_menos")
+
+#===============================================================================
+#9. Agrupando dados e gerando mapas
+#===============================================================================
+
+#===============================================================================
+#9.1.Serviços de mercado intensivos em conhecimento
+#===============================================================================
+
+#Tratamento de dados
+servicos_mercado_para_ds <- servicos_mercado_intensivos_conhecimento %>%
+  dplyr::mutate(
+    codigo = as.integer(as.character(codigo)) # Garante que é integer para o join
+  )
+
+#Cria uma coluna para toda CNAE correspondente
+servicos_mercado_para_ds_flagged <- servicos_mercado_para_ds %>%
+  dplyr::mutate(
+    categoria_servico = "servicos_mercado_intensivos_conhecimento" # Flag para esta categoria
+  )
+
+#Salvar para um arquivo Parquet temporário e abrir como Dataset
+temp_dir_parquet_mercado <- paste0(base_dir, "temp_servicos_mercado_intensivos_parquet/")
+dir.create(temp_dir_parquet_mercado, showWarnings = FALSE)
+temp_parquet_file_mercado <- paste0(temp_dir_parquet_mercado, "servicos_mercado_intensivos.parquet")
+arrow::write_parquet(servicos_mercado_para_ds_flagged, temp_parquet_file_mercado)
+
+servicos_mercado_intensivos_ds <- arrow::open_dataset(temp_parquet_file_mercado)
+
+# Realizar o JOIN para identificar estabelecimentos da categoria
+# Fazemos um LEFT JOIN. 'estabelecimento' é o lado esquerdo (x).
+# Do lado direito, selecionamos 'codigo' (a chave) e a nova coluna 'categoria_servico' (o flag).
+dados_mercado_intensivos_temp <- estabelecimento_ativos %>%
+  dplyr::left_join(
+    servicos_mercado_intensivos_ds %>% dplyr::select(codigo, categoria_servico),
+    by = c("cnae_primaria" = "codigo")
+  )
+
+#Filtra as linhas que pertencem a categoria
+dados_mercado_intensivos <- dados_mercado_intensivos_temp %>%
+  dplyr::filter(!is.na(categoria_servico)) %>% # Filtra para manter apenas os que tiveram match
+  dplyr::select(-categoria_servico) # Remove a coluna flag
+
+#Salvar o DataFrame Resultante em Parquet
+output_path_dados_mercado <- paste0(base_dir, "dados_mercado_intensivos.parquet")
+arrow::write_dataset(
+  dados_mercado_intensivos,
+  path = output_path_dados_mercado,
+  format = "parquet",
+  partitioning = NULL
+)
+
+#Abrir o resultado final como um Dataset para o mapa
+dados_mercado_intensivos_final_ds <- arrow::open_dataset(output_path_dados_mercado)
+
+#Limpar arquivos temporários
+unlink(temp_dir_parquet_mercado, recursive = TRUE)
+
+#Contar Estabelecimentos por Município para a Categoria Específica
+estabelecimentos_por_municipio_mercado <- dados_mercado_intensivos_final_ds %>%
+  dplyr::group_by(codigo_ibge) %>%
+  dplyr::summarise(num_estabelecimentos = n()) %>%
+  dplyr::collect()
+
+
+#Juntar os Dados de Municípios (geobr) com as Contagens da Categoria
+municipios_com_dados_mercado_mapa <- municipios_2022 %>%
+  dplyr::mutate(code_muni = as.character(code_muni))
+
+
+municipios_com_dados_mercado_mapa <- municipios_com_dados_mercado_mapa %>%
+  dplyr::left_join(
+    estabelecimentos_por_municipio_mercado %>%
+      dplyr::rename(code_muni = codigo_ibge), #Cria as condições pro join
+    by = "code_muni" #Realiza o join
+  )
+
+#Aqui é necessário uma análise da distribuição dos estabelecimentos
+#para definir quais serão as faixas de CNPj para o mapa. Isso estará no 
+#Apêndice B, disponibilizado no final do documento. 
+#A partir das estatísiticas, temos como breaks e labels (que serão padronizados
+#para as demais categorias para garantir a possibilidade de comparação entre elas):
+
+#Criação das faixas
+breaks_otimizados <- c(-Inf, 0, 100, 500, 2000, 10000, 100000, Inf) #categorias
+labels_otimizados <- c("0", "1-100", "101-500", "501-2K", "2K-10K", "10K-100K", "100K+") #Legenda
+
+#Preparando os dados para vizualização em um mapa
+municipios_com_dados_mercado_mapa <- municipios_com_dados_mercado_mapa %>%
+  dplyr::mutate(
+    num_estabelecimentos = ifelse(is.na(num_estabelecimentos), 0, num_estabelecimentos), #Lidando com NAs
+    num_estabelecimentos_bin = cut(num_estabelecimentos, #divide em intervalos
+                                   breaks = breaks_otimizados, #pontos de corte dos intervalos
+                                   labels = labels_otimizados, #nome dos intervalos
+                                   right = FALSE, #intervalo semi-aberto
+                                   include.lowest = TRUE, #inclui o valor mínimo
+                                   ordered_result = TRUE) #é um fator ordenado
+  )
+
+# --- DEFINIÇÕES DA PALETA DE CORES ---
+cor<- "#BBBBFA" #cor escolhida
+
+num_categorias_exceto_zero <- length(labels_otimizados) - 1 #garante que teremos a quantidade de cores igual a qntd de categorias
+
+# Gerar tons sequenciais da nova cor base usando 'sequential_hcl' do colorspace
+tons_progressivos <- colorspace::sequential_hcl(
+  n = num_categorias_exceto_zero,
+  h = c(260, 270), #Caso a cor se altere, esses números irão se alterar
+  c = c(20, 80),   # <--- Croma: Começa baixa para claro e aumenta para escuro
+  l = c(98, 40),   # <--- Luminosidade: Começa MUITO clara (98) e vai para um escuro médio (40)
+  power = 1.0
+)
+
+# Combine a cor branca para a categoria "0" com os novos tons
+paleta <- c("white", tons_progressivos)
+
+# criando o mapa
+mapa_estabelecimentos_mercado <- ggplot(municipios_com_dados_mercado_mapa) +
+  geom_sf(aes(fill = num_estabelecimentos_bin),
+          color = "#00000010",   # Cor das linhas dos municípios (preto quase transparente)
+          linewidth = 0.01) +
+  # Camada de fronteiras estaduais
+  geom_sf(data = uf_br,
+          fill = NA,
+          color = "#666666", # Cor das linhas estaduais (cinza escuro)
+          linewidth = 0.6) +
+  scale_fill_manual(
+    name = "Nº de Estabelecimentos",
+    values = setNames(
+      paleta, # Usando a NOVA paleta ajustada
+      labels_otimizados # Atribui as cores aos rótulos das categorias
+    ),
+    drop = FALSE,
+    na.value = "white" # NAs (se houver algum) também serão brancos/transparentes, como o 0.
+  ) +
+  labs(
+    title = "Estabelecimentos de 'Serviços de Mercado Intensivos em Conhecimento' por Município (2025)",
+    subtitle = "Dados do CNPJ (Discretizado por Faixas)",
+    caption = "Fonte: Receita Federal (CNPJ), IBGE (geobr). "
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right"
+  ) +
+  annotation_scale(location = "bl", pad_x = unit(0.5, "cm"), pad_y = unit(0.5, "cm"), style = "bar", text_cex = 0.8) +
+  annotation_north_arrow(location = "tr",
+                         which_north = "true",
+                         pad_x = unit(0.8, "cm"),
+                         pad_y = unit(0.8, "cm"),
+                         style = ggspatial::north_arrow_orienteering)
+
+windows()
+print(mapa_estabelecimentos_mercado)
+#Salvando em um arquivo
+ggsave("mapa_estabelecimentos_mercado_intensivos.png", mapa_estabelecimentos_mercado, width = 10, height = 10, dpi = 300) # Salva o mapa
+
+#===============================================================================
+#9.2.Serviços de conhecimento de alta tecnologia
+#===============================================================================
+
+#Será o mesmo procedimento anterior, mas para a nova categoria, assim como para as outras
+servicos_alta_tecnologia_para_ds <- servicos_conhecimento_alta_tecnologia %>%
+  dplyr::mutate(
+    codigo = as.integer(as.character(codigo)) # Garante que é integer para o join
+  )
+
+# b) Adicionar a coluna FLAG à 'servicos_alta_tecnologia_para_ds'
+servicos_alta_tecnologia_para_ds_flagged <- servicos_alta_tecnologia_para_ds %>%
+  dplyr::mutate(
+    categoria_servico = "servicos_conhecimento_alta_tecnologia" # <--- FLAG PARA ESTA CATEGORIA
+  )
+
+# c) Salvar para um arquivo Parquet temporário e abrir como Dataset
+temp_dir_parquet_alta_tecnologia <- paste0(base_dir, "temp_servicos_alta_tecnologia_parquet/")
+dir.create(temp_dir_parquet_alta_tecnologia, showWarnings = FALSE)
+temp_parquet_file_alta_tecnologia <- paste0(temp_dir_parquet_alta_tecnologia, "servicos_alta_tecnologia.parquet")
+arrow::write_parquet(servicos_alta_tecnologia_para_ds_flagged, temp_parquet_file_alta_tecnologia)
+
+servicos_alta_tecnologia_ds <- arrow::open_dataset(temp_parquet_file_alta_tecnologia)
+
+#Realizar o JOIN para identificar estabelecimentos da categoria
+# Fazemos um LEFT JOIN. 'estabelecimento' é o lado esquerdo (x).
+# Do lado direito, selecionamos 'codigo' (a chave) e a nova coluna 'categoria_servico' (o flag).
+dados_alta_tecnologia_temp <- estabelecimento_ativos %>%
+  dplyr::left_join(
+    servicos_alta_tecnologia_ds %>% dplyr::select(codigo, categoria_servico),
+    by = c("cnae_primaria" = "codigo")
+  )
+
+#FILTRAR APENAS AS LINHAS QUE PERTENCEM À CATEGORIA
+dados_alta_tecnologia <- dados_alta_tecnologia_temp %>%
+  dplyr::filter(!is.na(categoria_servico)) %>% # Filtra para manter apenas os que tiveram match
+  dplyr::select(-categoria_servico) # Remove a coluna flag, se não for necessária no final
+
+#Salvar o DataFrame Resultante em Parquet 
+output_path_dados_alta_tecnologia <- paste0(base_dir, "dados_alta_tecnologia.parquet")
+arrow::write_dataset(
+  dados_alta_tecnologia,
+  path = output_path_dados_alta_tecnologia,
+  format = "parquet",
+  partitioning = NULL
+)
+
+#Abrir o resultado final como um Dataset para o mapa
+dados_alta_tecnologia_final_ds <- arrow::open_dataset(output_path_dados_alta_tecnologia)
+
+#Limpar arquivos temporários 
+unlink(temp_dir_parquet_alta_tecnologia, recursive = TRUE)
+
+#Contar Estabelecimentos por Município para a Categoria Específica
+estabelecimentos_por_municipio_alta_tecnologia_g. <- dados_alta_tecnologia_final_ds %>% 
+  dplyr::group_by(codigo_ibge) %>%
+  dplyr::summarise(num_estabelecimentos = n()) %>%
+  dplyr::collect()
+
+
+#Juntar os Dados de Municípios (geobr) com as Contagens da Categoria
+municipios_com_dados_alta_tecnologia_mapa_g. <- municipios_2022 %>%
+  dplyr::mutate(code_muni = as.character(code_muni))
+
+municipios_com_dados_alta_tecnologia_mapa_g. <- municipios_com_dados_alta_tecnologia_mapa_g. %>%
+  dplyr::left_join(
+    estabelecimentos_por_municipio_alta_tecnologia_g. %>%
+      dplyr::rename(code_muni = codigo_ibge), # Renomeia para 'code_muni' para o join
+    by = "code_muni" # Realiza o join usando a coluna com o mesmo nome
+  )
+
+#Cria os breaks e labels
+breaks_otimizados <- c(-Inf, 0, 100, 250, 500, 1000, 5000, 20000, 100000, Inf)
+labels_otimizados <- c("0", "1-100", "101-250", "251-500", "501-1K", "1K-5K", "5K-20K", "20K-100K", "100K+")
+
+#Prepara os dados
+municipios_com_dados_alta_tecnologia_mapa_g. <- municipios_com_dados_alta_tecnologia_mapa_g. %>%
+  dplyr::mutate(
+    num_estabelecimentos = ifelse(is.na(num_estabelecimentos), 0, num_estabelecimentos),
+    num_estabelecimentos_bin = cut(num_estabelecimentos,
+                                   breaks = breaks_otimizados,
+                                   labels = labels_otimizados,
+                                   right = FALSE,
+                                   include.lowest = TRUE,
+                                   ordered_result = TRUE)
+  )
+
+#Criar o Mapa para "Serviços Intensivos em Conhecimento de Alta Tecnologia"
+mapa_estabelecimentos_alta_tecnologia_g. <- ggplot(municipios_com_dados_alta_tecnologia_mapa_g.) +
+  geom_sf(aes(fill = num_estabelecimentos_bin),
+          color = "#00000010",   # Cor das linhas dos municípios (preto quase transparente para não poluir)
+          linewidth = 0.01) + # Espessura da linha dos municípios muito fina
+  # Camada de fronteiras estaduais (mantida para ambos os mapas)
+  geom_sf(data = uf_br,
+          fill = NA,
+          color = "#666666", # Cor das linhas estaduais (cinza escuro)
+          linewidth = 0.6) +
+  #ESCALA DE CORES
+  scale_fill_manual(
+    name = "Nº de Estabelecimentos",
+    values = paleta, 
+    drop = FALSE,
+    na.value = "white" # NAs (se houver algum) também serão brancos/transparentes, como o 0.
+  ) +
+  labs(
+    title = "Estabelecimentos de 'Serviços Intensivos em Conhecimento de Alta Tecnologia' por Município (2025)", 
+    subtitle = "Dados do CNPJ (Discretizado por Faixas)",
+    caption = "Fonte: Receita Federal (CNPJ), IBGE (geobr)."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right"
+  ) +
+  annotation_scale(location = "bl", pad_x = unit(0.5, "cm"), pad_y = unit(0.5, "cm"), style = "bar", text_cex = 0.8) +
+  annotation_north_arrow(location = "tr", which_north = "true", pad_x = unit(0.8, "cm"), pad_y = unit(0.8, "cm"), style = ggspatial::north_arrow_orienteering)
+
+windows()
+print(mapa_estabelecimentos_alta_tecnologia_g.) # Exibe o mapa na janela
+
+#Salvar o Mapa
+ggsave("mapa_estabelecimentos_alta_tecnologia.png", mapa_estabelecimentos_alta_tecnologia_g., width = 10, height = 10, dpi = 300) # <--- NOME DO ARQUIVO ATUALIZADO
+
+#===============================================================================
+#9.3. Serviços financeiros intensivos em conhecimento
+#===============================================================================
+
+servicos_financeiro_para_ds <- servicos_financeiro_conhecimento %>%
+  dplyr::mutate(
+    codigo = as.integer(as.character(codigo)) # Garante que é integer para o join
+  )
+
+#Adicionar a coluna FLAG à 'servicos_financeiro_para_ds'
+servicos_financeiro_para_ds_flagged <- servicos_financeiro_para_ds %>%
+  dplyr::mutate(
+    categoria_servico = "servicos_financeiro_conhecimento" # <--- FLAG PARA ESTA CATEGORIA
+  )
+
+#Salvar para um arquivo Parquet temporário e abrir como Dataset
+temp_dir_parquet_financeiro <- paste0(base_dir, "temp_servicos_financeiro_parquet/")
+dir.create(temp_dir_parquet_financeiro, showWarnings = FALSE)
+temp_parquet_file_financeiro <- paste0(temp_dir_parquet_financeiro, "servicos_financeiro.parquet")
+arrow::write_parquet(servicos_financeiro_para_ds_flagged, temp_parquet_file_financeiro)
+
+servicos_financeiro_ds <- arrow::open_dataset(temp_parquet_file_financeiro)
+
+#Realizar o JOIN para identificar estabelecimentos da categoria
+#Fazemos um LEFT JOIN. 'estabelecimento' é o lado esquerdo (x).
+#Do lado direito, selecionamos 'codigo' (a chave) e a coluna 'categoria_servico' (o flag).
+dados_financeiro_temp <- estabelecimento_ativos %>%
+  dplyr::left_join(
+    servicos_financeiro_ds %>% dplyr::select(codigo, categoria_servico),
+    by = c("cnae_primaria" = "codigo")
+  )
+
+#FILTRAR APENAS AS LINHAS QUE PERTENCEM À CATEGORIA
+dados_financeiro <- dados_financeiro_temp %>%
+  dplyr::filter(!is.na(categoria_servico)) %>% # Filtra para manter apenas os que tiveram match
+  dplyr::select(-categoria_servico) # Remove a coluna flag, se não for necessária no final
+
+#Salvar o DataFrame Resultante em Parquet
+output_path_dados_financeiro <- paste0(base_dir, "dados_financeiro.parquet")
+arrow::write_dataset(
+  dados_financeiro,
+  path = output_path_dados_financeiro,
+  format = "parquet",
+  partitioning = NULL
+)
+
+#Abrir o resultado final como um Dataset para o mapa
+dados_financeiro_final_ds <- arrow::open_dataset(output_path_dados_financeiro)
+
+#Limpar arquivos temporários 
+unlink(temp_dir_parquet_financeiro, recursive = TRUE)
+
+#Contar Estabelecimentos por Município para a Categoria Específica 
+estabelecimentos_por_municipio_financeiro_g. <- dados_financeiro_final_ds %>% 
+  dplyr::group_by(codigo_ibge) %>%
+  dplyr::summarise(num_estabelecimentos = n()) %>%
+  dplyr::collect()
+
+
+#Juntar os Dados de Municípios (geobr) com as Contagens da Categoria 
+municipios_com_dados_financeiro_mapa_g. <- municipios_2022 %>%
+  dplyr::mutate(code_muni = as.character(code_muni))
+
+municipios_com_dados_financeiro_mapa_g. <- municipios_com_dados_financeiro_mapa_g. %>%
+  dplyr::left_join(
+    estabelecimentos_por_municipio_financeiro_g. %>%
+      dplyr::rename(code_muni = codigo_ibge), # Renomeia para 'code_muni' para o join
+    by = "code_muni" # Realiza o join usando a coluna com o mesmo nome
+  )
+#Garante a existência dos breaks e labels
+breaks_otimizados <- c(-Inf, 0, 100, 250, 500, 1000, 5000, 20000, 100000, Inf)
+labels_otimizados <- c("0", "1-100", "101-250", "251-500", "501-1K", "1K-5K", "5K-20K", "20K-100K", "100K+")
+
+#Prepara para a criação do mapa
+municipios_com_dados_financeiro_mapa_g. <- municipios_com_dados_financeiro_mapa_g. %>%
+  dplyr::mutate(
+    num_estabelecimentos = ifelse(is.na(num_estabelecimentos), 0, num_estabelecimentos),
+    num_estabelecimentos_bin = cut(num_estabelecimentos,
+                                   breaks = breaks_otimizados,
+                                   labels = labels_otimizados,
+                                   right = FALSE,
+                                   include.lowest = TRUE,
+                                   ordered_result = TRUE)
+  )
+
+#Criar o Mapa para "Serviços Financeiros Intensivos em Conhecimento" 
+mapa_estabelecimentos_financeiro_g. <- ggplot(municipios_com_dados_financeiro_mapa_g.) +
+  geom_sf(aes(fill = num_estabelecimentos_bin),
+          color = "#00000010", # Cor das linhas dos municípios (preto quase transparente)
+          linewidth = 0.01) + # Mantendo a espessura fina como nos outros mapas
+  # Camada de fronteiras estaduais
+  geom_sf(data = uf_br,
+          fill = NA,
+          color = "#666666", # Cor das linhas estaduais (cinza escuro)
+          linewidth = 0.6) +
+  # --- ESCALA DE CORES COM A PALETA AZUL/LAVANDA (paleta) ---
+  scale_fill_manual(
+    name = "Nº de Estabelecimentos",
+    values = paleta, 
+    drop = FALSE,
+    na.value = "white" # NAs (se houver algum) também serão brancos/transparentes, como o 0.
+  ) +
+  labs(
+    title = "Estabelecimentos de 'Serviços Financeiros Intensivos em Conhecimento' por Município (2025)",
+    subtitle = "Dados do CNPJ (Discretizado por Faixas)",
+    caption = "Fonte: Receita Federal (CNPJ), IBGE (geobr). "
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right"
+  ) +
+  annotation_scale(location = "bl", pad_x = unit(0.5, "cm"), pad_y = unit(0.5, "cm"), style = "bar", text_cex = 0.8) +
+  annotation_north_arrow(location = "tr",
+                         which_north = "true",
+                         pad_x = unit(0.8, "cm"),
+                         pad_y = unit(0.8, "cm"),
+                         style = ggspatial::north_arrow_orienteering)
+
+windows()
+print(mapa_estabelecimentos_financeiro_g.)
+
+# --- 11. Salvar o Mapa ---
+ggsave("mapa_estabelecimentos_financeiro.png", mapa_estabelecimentos_financeiro_g., width = 10, height = 10, dpi = 300)
+
+#===============================================================================
+#9.4. Serviços intensivos em conhecimento administração pública, saúde, educação e outros
+#===============================================================================
+
+servicos_administracao_para_ds <- servicos_administracao_conhecimento %>%
+  dplyr::mutate(
+    codigo = as.integer(as.character(codigo)) # Garante que é integer para o join
+  )
+
+#Adicionar a coluna FLAG à 'servicos_administracao_para_ds'
+servicos_administracao_para_ds_flagged <- servicos_administracao_para_ds %>%
+  dplyr::mutate(
+    categoria_servico = "servicos_administracao_conhecimento" # <--- FLAG PARA ESTA CATEGORIA
+  )
+
+#Salvar para um arquivo Parquet temporário e abrir como Dataset
+temp_dir_parquet_administracao <- paste0(base_dir, "temp_servicos_administracao_parquet/")
+dir.create(temp_dir_parquet_administracao, showWarnings = FALSE)
+temp_parquet_file_administracao <- paste0(temp_dir_parquet_administracao, "servicos_administracao.parquet")
+arrow::write_parquet(servicos_administracao_para_ds_flagged, temp_parquet_file_administracao)
+
+servicos_administracao_ds <- arrow::open_dataset(temp_parquet_file_administracao)
+
+#Realizar o JOIN para identificar estabelecimentos da categoria
+# Fazemos um LEFT JOIN. 'estabelecimento' é o lado esquerdo (x).
+# Do lado direito, selecionamos 'codigo' (a chave) e a coluna 'categoria_servico' (o flag).
+dados_administracao_temp <- estabelecimento_ativos %>%
+  dplyr::left_join(
+    servicos_administracao_ds %>% dplyr::select(codigo, categoria_servico),
+    by = c("cnae_primaria" = "codigo")
+  )
+
+#FILTRAR APENAS AS LINHAS QUE PERTENCEM À CATEGORIA 
+dados_administracao <- dados_administracao_temp %>%
+  dplyr::filter(!is.na(categoria_servico)) %>% # Filtra para manter apenas os que tiveram match
+  dplyr::select(-categoria_servico) # Remove a coluna flag, se não for necessária no final
+
+#Salvar o DataFrame Resultante em Parquet
+output_path_dados_administracao <- paste0(base_dir, "dados_administracao.parquet")
+arrow::write_dataset(
+  dados_administracao,
+  path = output_path_dados_administracao,
+  format = "parquet",
+  partitioning = NULL
+)
+
+#Abrir o resultado final como um Dataset para o mapa 
+dados_administracao_final_ds <- arrow::open_dataset(output_path_dados_administracao)
+
+#Limpar arquivos temporários
+unlink(temp_dir_parquet_administracao, recursive = TRUE)
+
+#Contar Estabelecimentos por Município para a Categoria Específica 
+estabelecimentos_por_municipio_administracao_g. <- dados_administracao_final_ds %>% # Variável nova
+  dplyr::group_by(codigo_ibge) %>%
+  dplyr::summarise(num_estabelecimentos = n()) %>%
+  dplyr::collect()
+
+
+#Juntar os Dados de Municípios (geobr) com as Contagens da Categoria
+municipios_com_dados_administracao_mapa_g. <- municipios_2022 %>%
+  dplyr::mutate(code_muni = as.character(code_muni))
+
+municipios_com_dados_administracao_mapa_g. <- municipios_com_dados_administracao_mapa_g. %>%
+  dplyr::left_join(
+    estabelecimentos_por_municipio_administracao_g. %>%
+      dplyr::rename(code_muni = codigo_ibge), # Renomeia para 'code_muni' para o join
+    by = "code_muni" # Realiza o join usando a coluna com o mesmo nome
+  )
+
+#Cria os breaks e labels
+breaks_otimizados <- c(-Inf, 0, 100, 250, 500, 1000, 5000, 20000, 100000, Inf)
+labels_otimizados <- c("0", "1-100", "101-250", "251-500", "501-1K", "1K-5K", "5K-20K", "20K-100K", "100K+")
+
+#Prepara para a criação do mapa
+municipios_com_dados_administracao_mapa_g. <- municipios_com_dados_administracao_mapa_g. %>%
+  dplyr::mutate(
+    num_estabelecimentos = ifelse(is.na(num_estabelecimentos), 0, num_estabelecimentos),
+    num_estabelecimentos_bin = cut(num_estabelecimentos,
+                                   breaks = breaks_otimizados,
+                                   labels = labels_otimizados,
+                                   right = FALSE,
+                                   include.lowest = TRUE,
+                                   ordered_result = TRUE)
+  )
+
+#Criar o Mapa para "Serviços Intensivos em Conhecimento Administração Pública, Saúde, Educação e Outros" 
+mapa_estabelecimentos_administracao_g. <- ggplot(municipios_com_dados_administracao_mapa_g.) + # <--- DADOS DO MAPA DE ADMINISTRAÇÃO
+  geom_sf(aes(fill = num_estabelecimentos_bin),
+          color = "#00000010",   # Cor das linhas dos municípios (preto quase transparente)
+          linewidth = 0.01) + # Espessura da linha dos municípios muito fina
+  # Camada de fronteiras estaduais
+  geom_sf(data = uf_br,
+          fill = NA,
+          color = "#666666", # Cor das linhas estaduais (cinza escuro)
+          linewidth = 0.6) +
+  # --- ESCALA DE CORES COM A PALETA AZUL/LAVANDA (paleta) ---
+  scale_fill_manual(
+    name = "Nº de Estabelecimentos",
+    values = paleta, 
+    drop = FALSE,
+    na.value = "white" # NAs (se houver algum) também serão brancos/transparentes, como o 0.
+  ) +
+  labs(
+    title = "Estabelecimentos de 'Serviços Intensivos em Conhecimento Administração Pública, Saúde, Educação e Outros' por Município (2025)", # <--- TÍTULO ATUALIZADO
+    subtitle = "Dados do CNPJ (Discretizado por Faixas)",
+    caption = "Fonte: Receita Federal (CNPJ), IBGE (geobr)."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right"
+  ) +
+  annotation_scale(location = "bl", pad_x = unit(0.5, "cm"), pad_y = unit(0.5, "cm"), style = "bar", text_cex = 0.8) +
+  annotation_north_arrow(location = "tr",
+                         which_north = "true",
+                         pad_x = unit(0.8, "cm"),
+                         pad_y = unit(0.8, "cm"),
+                         style = ggspatial::north_arrow_orienteering)
+
+windows()
+print(mapa_estabelecimentos_administracao_g.) # Exibe o mapa na janela
+
+# --- SALVAR O MAPA ---
+ggsave("mapa_estabelecimentos_administracao.png", mapa_estabelecimentos_administracao_g., width = 10, height = 10, dpi = 300) # <--- NOME DO ARQUIVO ATUALIZADO
+
+#===============================================================================
+#9.5.Serviços de mercado menos intensivos em conhecimento: comércio: 
+#===============================================================================
+
+servicos_mercado_menos_para_ds <- servicos_mercado_menos %>%
+  dplyr::mutate(
+    codigo = as.integer(as.character(codigo)) # Garante que é integer para o join
+  )
+
+#Adicionar a coluna FLAG à 'servicos_mercado_menos_para_ds'
+servicos_mercado_menos_para_ds_flagged <- servicos_mercado_menos_para_ds %>%
+  dplyr::mutate(
+    categoria_servico = "servicos_mercado_menos" # <--- FLAG PARA ESTA CATEGORIA
+  )
+
+#Salvar para um arquivo Parquet temporário e abrir como Dataset
+temp_dir_parquet_mercado_menos <- paste0(base_dir, "temp_servicos_mercado_menos_parquet/")
+dir.create(temp_dir_parquet_mercado_menos, showWarnings = FALSE)
+temp_parquet_file_mercado_menos <- paste0(temp_dir_parquet_mercado_menos, "servicos_mercado_menos.parquet")
+arrow::write_parquet(servicos_mercado_menos_para_ds_flagged, temp_parquet_file_mercado_menos)
+
+servicos_mercado_menos_ds <- arrow::open_dataset(temp_parquet_file_mercado_menos)
+
+#Realizar o JOIN para identificar estabelecimentos da categoria
+#Fazemos um LEFT JOIN. 'estabelecimento' é o lado esquerdo (x).
+#Do lado direito, selecionamos 'codigo' (a chave) e a coluna 'categoria_servico' (o flag).
+dados_mercado_menos_temp <- estabelecimento_ativos %>%
+  dplyr::left_join(
+    servicos_mercado_menos_ds %>% dplyr::select(codigo, categoria_servico),
+    by = c("cnae_primaria" = "codigo")
+  )
+
+#FILTRAR APENAS AS LINHAS QUE PERTENCEM À CATEGORIA
+dados_mercado_menos <- dados_mercado_menos_temp %>%
+  dplyr::filter(!is.na(categoria_servico)) %>% # Filtra para manter apenas os que tiveram match
+  dplyr::select(-categoria_servico) # Remove a coluna flag, se não for necessária no final
+
+#Salvar o DataFrame Resultante em Parquet
+output_path_dados_mercado_menos <- paste0(base_dir, "dados_mercado_menos.parquet")
+arrow::write_dataset(
+  dados_mercado_menos,
+  path = output_path_dados_mercado_menos,
+  format = "parquet",
+  partitioning = NULL
+)
+
+#Abrir o resultado final como um Dataset para o mapa 
+dados_mercado_menos_final_ds <- arrow::open_dataset(output_path_dados_mercado_menos)
+
+#Limpar arquivos temporários
+unlink(temp_dir_parquet_mercado_menos, recursive = TRUE)
+
+#Contar Estabelecimentos por Município para a Categoria Específica
+estabelecimentos_por_municipio_mercado_menos_g. <- dados_mercado_menos_final_ds %>%
+  dplyr::group_by(codigo_ibge) %>%
+  dplyr::summarise(num_estabelecimentos = n()) %>%
+  dplyr::collect()
+
+
+#Juntar os Dados de Municípios (geobr) com as Contagens da Categoria 
+municipios_com_dados_mercado_menos_mapa_g. <- municipios_2022 %>%
+  dplyr::mutate(code_muni = as.character(code_muni))
+
+municipios_com_dados_mercado_menos_mapa_g. <- municipios_com_dados_mercado_menos_mapa_g. %>%
+  dplyr::left_join(
+    estabelecimentos_por_municipio_mercado_menos_g. %>%
+      dplyr::rename(code_muni = codigo_ibge), # Renomeia para 'code_muni' para o join
+    by = "code_muni" # Realiza o join usando a coluna com o mesmo nome
+  )
+
+# Cria os breaks e labels
+breaks_otimizados <- c(-Inf, 0, 100, 250, 500, 1000, 5000, 20000, 100000, Inf)
+labels_otimizados <- c("0", "1-100", "101-250", "251-500", "501-1K", "1K-5K", "5K-20K", "20K-100K", "100K+")
+
+#Prepara para a criação do mapa
+municipios_com_dados_mercado_menos_mapa_g. <- municipios_com_dados_mercado_menos_mapa_g. %>%
+  dplyr::mutate(
+    num_estabelecimentos = ifelse(is.na(num_estabelecimentos), 0, num_estabelecimentos),
+    num_estabelecimentos_bin = cut(num_estabelecimentos,
+                                   breaks = breaks_otimizados,
+                                   labels = labels_otimizados,
+                                   right = FALSE,
+                                   include.lowest = TRUE,
+                                   ordered_result = TRUE)
+  )
+
+#Criar o Mapa para "Serviços de Mercado Menos Intensivos em Conhecimento: Comércio" 
+mapa_estabelecimentos_mercado_menos_g. <- ggplot(municipios_com_dados_mercado_menos_mapa_g.) + # <--- DADOS DO MAPA DE MERCADO MENOS INTENSIVO
+  geom_sf(aes(fill = num_estabelecimentos_bin),
+          color = "#00000010",   # Cor das linhas dos municípios (preto quase transparente)
+          linewidth = 0.01) + # Espessura da linha dos municípios muito fina
+  # Camada de fronteiras estaduais
+  geom_sf(data = uf_br,
+          fill = NA,
+          color = "#666666", # Cor das linhas estaduais (cinza escuro)
+          linewidth = 0.6) +
+  # --- ESCALA DE CORES COM A PALETA AZUL/LAVANDA (paleta) ---
+  scale_fill_manual(
+    name = "Nº de Estabelecimentos",
+    values = paleta, # 
+    drop = FALSE,
+    na.value = "white" # NAs (se houver algum) também serão brancos/transparentes, como o 0.
+  ) +
+  labs(
+    title = "Estabelecimentos de 'Serviços de Mercado Menos Intensivos em Conhecimento: Comércio' por Município (2025)", # <--- TÍTULO ATUALIZADO
+    subtitle = "Dados do CNPJ (Discretizado por Faixas)",
+    caption = "Fonte: Receita Federal (CNPJ), IBGE (geobr)."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right"
+  ) +
+  annotation_scale(location = "bl", pad_x = unit(0.5, "cm"), pad_y = unit(0.5, "cm"), style = "bar", text_cex = 0.8) +
+  annotation_north_arrow(location = "tr",
+                         which_north = "true",
+                         pad_x = unit(0.8, "cm"),
+                         pad_y = unit(0.8, "cm"),
+                         style = ggspatial::north_arrow_orienteering)
+
+windows()
+print(mapa_estabelecimentos_mercado_menos_g.) # Exibe o mapa na janela
+#Salva o mapa
+ggsave("mapa_estabelecimentos_mercado_menos.png", mapa_estabelecimentos_mercado_menos_g., width = 10, height = 10, dpi = 300)
+
+#===============================================================================
+#9.6.Serviços de mercado menos intensivos em conhecimento: diversos:
+#===============================================================================
+
+servicos_diversos_menos_para_ds <- servicos_diversos_menos %>%
+  dplyr::mutate(
+    codigo = as.integer(as.character(codigo)) # Garante que é integer para o join
+  )
+
+#Adicionar a coluna FLAG à 'servicos_diversos_menos_para_ds'
+servicos_diversos_menos_para_ds_flagged <- servicos_diversos_menos_para_ds %>%
+  dplyr::mutate(
+    categoria_servico = "servicos_diversos_menos" # <--- FLAG PARA ESTA CATEGORIA
+  )
+
+#Salvar para um arquivo Parquet temporário e abrir como Dataset
+temp_dir_parquet_diversos_menos <- paste0(base_dir, "temp_servicos_diversos_menos_parquet/")
+dir.create(temp_dir_parquet_diversos_menos, showWarnings = FALSE)
+temp_parquet_file_diversos_menos <- paste0(temp_dir_parquet_diversos_menos, "servicos_diversos_menos.parquet")
+arrow::write_parquet(servicos_diversos_menos_para_ds_flagged, temp_parquet_file_diversos_menos)
+
+servicos_diversos_menos_ds <- arrow::open_dataset(temp_parquet_file_diversos_menos)
+
+#Realizar o JOIN para identificar estabelecimentos da categoria ---
+# Fazemos um LEFT JOIN. 'estabelecimento' é o lado esquerdo (x).
+# Do lado direito, selecionamos 'codigo' (a chave) e a nova coluna 'categoria_servico' (o flag).
+dados_diversos_menos_temp <- estabelecimento_ativos %>%
+  dplyr::left_join(
+    servicos_diversos_menos_ds %>% dplyr::select(codigo, categoria_servico),
+    by = c("cnae_primaria" = "codigo")
+  )
+
+#FILTRAR APENAS AS LINHAS QUE PERTENCEM À CATEGORIA
+dados_diversos_menos <- dados_diversos_menos_temp %>%
+  dplyr::filter(!is.na(categoria_servico)) %>% # Filtra para manter apenas os que tiveram match
+  dplyr::select(-categoria_servico) # Remove a coluna flag, se não for necessária no final
+
+#Salvar o DataFrame Resultante em Parquet 
+output_path_dados_diversos_menos <- paste0(base_dir, "dados_diversos_menos.parquet")
+arrow::write_dataset(
+  dados_diversos_menos,
+  path = output_path_dados_diversos_menos,
+  format = "parquet",
+  partitioning = NULL
+)
+
+#Abrir o resultado final como um Dataset para o mapa 
+dados_diversos_menos_final_ds <- arrow::open_dataset(output_path_dados_diversos_menos)
+
+#Limpar arquivos temporários 
+unlink(temp_dir_parquet_diversos_menos, recursive = TRUE)
+
+#Contar Estabelecimentos por Município para a Categoria Específica 
+estabelecimentos_por_municipio_diversos_menos_g. <- dados_diversos_menos_final_ds %>%
+  dplyr::group_by(codigo_ibge) %>%
+  dplyr::summarise(num_estabelecimentos = n()) %>%
+  dplyr::collect()
+
+
+#Juntar os Dados de Municípios (geobr) com as Contagens da Categoria
+municipios_com_dados_diversos_mapa_g. <- municipios_2022 %>%
+  dplyr::mutate(code_muni = as.character(code_muni))
+
+municipios_com_dados_diversos_menos_mapa_g. <- municipios_com_dados_diversos_mapa_g. %>%
+  dplyr::left_join(
+    estabelecimentos_por_municipio_diversos_menos_g. %>%
+      dplyr::rename(code_muni = codigo_ibge), # Renomeia para 'code_muni' para o join
+    by = "code_muni" # Realiza o join usando a coluna com o mesmo nome
+  )
+
+#Cria os breaks e labels
+breaks_otimizados <- c(-Inf, 0, 100, 250, 500, 1000, 5000, 20000, 100000, Inf)
+labels_otimizados <- c("0", "1-100", "101-250", "251-500", "501-1K", "1K-5K", "5K-20K", "20K-100K", "100K+")
+
+#Prepara os dados para o mapa
+municipios_com_dados_diversos_menos_mapa_g. <- municipios_com_dados_diversos_menos_mapa_g. %>%
+  dplyr::mutate(
+    num_estabelecimentos = ifelse(is.na(num_estabelecimentos), 0, num_estabelecimentos),
+    num_estabelecimentos_bin = cut(num_estabelecimentos,
+                                   breaks = breaks_otimizados,
+                                   labels = labels_otimizados,
+                                   right = FALSE,
+                                   include.lowest = TRUE,
+                                   ordered_result = TRUE)
+  )
+
+#Criar o Mapa para "Serviços de Mercado Menos Intensivos em Conhecimento: Diversos"
+mapa_estabelecimentos_diversos_menos_g. <- ggplot(municipios_com_dados_diversos_menos_mapa_g.) + # <--- DADOS DO MAPA DE DIVERSOS MENOS INTENSIVOS
+  geom_sf(aes(fill = num_estabelecimentos_bin),
+          color = "#00000010",   # Cor das linhas dos municípios (preto quase transparente)
+          linewidth = 0.01) + # Espessura da linha dos municípios muito fina
+  # Camada de fronteiras estaduais
+  geom_sf(data = uf_br,
+          fill = NA,
+          color = "#666666", # Cor das linhas estaduais (cinza escuro)
+          linewidth = 0.6) +
+  # --- ESCALA DE CORES COM A PALETA AZUL/LAVANDA (paleta) ---
+  scale_fill_manual(
+    name = "Nº de Estabelecimentos",
+    values = paleta, # 
+    drop = FALSE,
+    na.value = "white" # NAs (se houver algum) também serão brancos/transparentes, como o 0.
+  ) +
+  labs(
+    title = "Estabelecimentos de 'Serviços de Mercado Menos Intensivos em Conhecimento: Diversos' por Município (2025)", # <--- TÍTULO ATUALIZADO
+    subtitle = "Dados do CNPJ (Discretizado por Faixas)",
+    caption = "Fonte: Receita Federal (CNPJ), IBGE (geobr)."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right"
+  ) +
+  annotation_scale(location = "bl", pad_x = unit(0.5, "cm"), pad_y = unit(0.5, "cm"), style = "bar", text_cex = 0.8) +
+  annotation_north_arrow(location = "tr",
+                         which_north = "true",
+                         pad_x = unit(0.8, "cm"),
+                         pad_y = unit(0.8, "cm"),
+                         style = ggspatial::north_arrow_orienteering)
+
+windows()
+print(mapa_estabelecimentos_diversos_menos_g.) # Exibe o mapa na janela
+
+# --- SALVAR O MAPA ---
+ggsave("mapa_estabelecimentos_diversos_menos_final.png", mapa_estabelecimentos_diversos_menos_g., width = 10, height = 10, dpi = 300) # <--- NOME DO ARQUIVO ATUALIZADO
+
+#===============================================================================
+#9.7.Demais serviços menos intensivos em conhecimento
+#===============================================================================
+
+servicos_demais_menos_para_ds <- servicos_demais_menos %>%
+  dplyr::mutate(
+    codigo = as.integer(as.character(codigo)) # Garante que é integer para o join
+  )
+
+#Adicionar a coluna FLAG à 'servicos_demais_menos_para_ds'
+servicos_demais_menos_para_ds_flagged <- servicos_demais_menos_para_ds %>%
+  dplyr::mutate(
+    categoria_servico = "servicos_demais_menos_intensivos" # <--- FLAG PARA ESTA CATEGORIA
+  )
+
+#Salvar para um arquivo Parquet temporário e abrir como Dataset
+temp_dir_parquet_demais_menos <- paste0(base_dir, "temp_servicos_demais_menos_parquet/")
+dir.create(temp_dir_parquet_demais_menos, showWarnings = FALSE)
+temp_parquet_file_demais_menos <- paste0(temp_dir_parquet_demais_menos, "servicos_demais_menos.parquet")
+arrow::write_parquet(servicos_demais_menos_para_ds_flagged, temp_parquet_file_demais_menos)
+
+servicos_demais_menos_ds <- arrow::open_dataset(temp_parquet_file_demais_menos)
+
+#Realizar o JOIN para identificar estabelecimentos da categoria ---
+# Fazemos um LEFT JOIN. 'estabelecimento' é o lado esquerdo (x).
+# Do lado direito, selecionamos 'codigo' (a chave) e a coluna 'categoria_servico' (o flag).
+dados_demais_menos_temp <- estabelecimento_ativos %>%
+  dplyr::left_join(
+    servicos_demais_menos_ds %>% dplyr::select(codigo, categoria_servico),
+    by = c("cnae_primaria" = "codigo")
+  )
+
+#FILTRAR APENAS AS LINHAS QUE PERTENCEM À CATEGORIA
+dados_demais_menos <- dados_demais_menos_temp %>%
+  dplyr::filter(!is.na(categoria_servico)) %>% # Filtra para manter apenas os que tiveram match
+  dplyr::select(-categoria_servico) # Remove a coluna flag, se não for necessária no final
+
+#Salvar o DataFrame Resultante em Parquet
+output_path_dados_demais_menos <- paste0(base_dir, "dados_demais_menos.parquet")
+arrow::write_dataset(
+  dados_demais_menos,
+  path = output_path_dados_demais_menos,
+  format = "parquet",
+  partitioning = NULL
+)
+
+#Abrir o resultado final como um Dataset para o mapa 
+dados_demais_menos_final_ds <- arrow::open_dataset(output_path_dados_demais_menos)
+
+#Limpar arquivos temporários
+unlink(temp_dir_parquet_demais_menos, recursive = TRUE)
+
+#Contar Estabelecimentos por Município para a Categoria Específica 
+estabelecimentos_por_municipio_demais_menos_g. <- dados_demais_menos_final_ds %>%
+  dplyr::group_by(codigo_ibge) %>%
+  dplyr::summarise(num_estabelecimentos = n()) %>%
+  dplyr::collect()
+
+
+#Juntar os Dados de Municípios (geobr) com as Contagens da Categoria
+municipios_com_dados_demais_menos_mapa_g. <- municipios_2022 %>%
+  dplyr::mutate(code_muni = as.character(code_muni))
+
+municipios_com_dados_demais_menos_mapa_g. <- municipios_com_dados_demais_menos_mapa_g. %>%
+  dplyr::left_join(
+    estabelecimentos_por_municipio_demais_menos_g. %>%
+      dplyr::rename(code_muni = codigo_ibge), # Renomeia para 'code_muni' para o join
+    by = "code_muni" # Realiza o join usando a coluna com o mesmo nome
+  )
+
+
+#Cria os breaks e labels
+breaks_otimizados <- c(-Inf, 0, 100, 250, 500, 1000, 5000, 20000, 100000, Inf)
+labels_otimizados <- c("0", "1-100", "101-250", "251-500", "501-1K", "1K-5K", "5K-20K", "20K-100K", "100K+")
+
+#Prepara para o mapa
+municipios_com_dados_demais_menos_mapa_g. <- municipios_com_dados_demais_menos_mapa_g. %>%
+  dplyr::mutate(
+    num_estabelecimentos = ifelse(is.na(num_estabelecimentos), 0, num_estabelecimentos),
+    num_estabelecimentos_bin = cut(num_estabelecimentos,
+                                   breaks = breaks_otimizados,
+                                   labels = labels_otimizados,
+                                   right = FALSE,
+                                   include.lowest = TRUE,
+                                   ordered_result = TRUE)
+  )
+
+#Criar o Mapa para "Demais serviços menos intensivos em conhecimento"
+mapa_estabelecimentos_demais_menos_g. <- ggplot(municipios_com_dados_demais_menos_mapa_g.) + # <--- DADOS DO MAPA DE DEMAIS MENOS INTENSIVOS
+  geom_sf(aes(fill = num_estabelecimentos_bin),
+          color = "#00000010",   # Cor das linhas dos municípios (preto quase transparente)
+          linewidth = 0.01) + # Espessura da linha dos municípios muito fina
+  # Camada de fronteiras estaduais
+  geom_sf(data = uf_br,
+          fill = NA,
+          color = "#666666", # Cor das linhas estaduais (cinza escuro)
+          linewidth = 0.6) +
+  # --- ESCALA DE CORES COM A PALETA AZUL/LAVANDA (paleta) ---
+  scale_fill_manual(
+    name = "Nº de Estabelecimentos",
+    values = paleta, 
+    drop = FALSE,
+    na.value = "white" # NAs (se houver algum) também serão brancos/transparentes, como o 0.
+  ) +
+  labs(
+    title = "Estabelecimentos de 'Demais serviços menos intensivos em conhecimento' por Município (2025)", # <--- TÍTULO ATUALIZADO
+    subtitle = "Dados do CNPJ (Discretizado por Faixas)",
+    caption = "Fonte: Receita Federal (CNPJ), IBGE (geobr)."
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right"
+  ) +
+  annotation_scale(location = "bl", pad_x = unit(0.5, "cm"), pad_y = unit(0.5, "cm"), style = "bar", text_cex = 0.8) +
+  annotation_north_arrow(location = "tr",
+                         which_north = "true",
+                         pad_x = unit(0.8, "cm"),
+                         pad_y = unit(0.8, "cm"),
+                         style = ggspatial::north_arrow_orienteering)
+
+windows()
+print(mapa_estabelecimentos_demais_menos_g.) # Exibe o mapa na janela
+# --- 11. Salvar o Mapa ---
+ggsave("mapa_estabelecimentos_demais_menos.png", mapa_estabelecimentos_demais_menos_g., width = 10, height = 10, dpi = 300)
+rm(mapa_estabelecimentos_demais_menos_g.)
+rm()
+
+municipios_filtrados_alta_tecnologia <- municipios_com_dados_alta_tecnologia_mapa_g. %>%
+  filter(num_estabelecimentos > 20000)
+municipios_filtrados_mercado<- municipios_com_dados_mercado_mapa %>%
+  filter(num_estabelecimentos > 20000)
+
+#===============================================================================
+#10.Conclusões
+#===============================================================================
+
+#   Os dados apontam para uma forte concentração do setor de serviços em regiões
+#com alta densidade populacional. É notável ainda a diferença na espacialização
+#do setor de serviços conforme sua categorização, apresentando uma quantidade significativamente
+#maior de CNPJs em categorias com menor intensidade de conhecimento.
+#   Portanto, a hipótese de que, mesmo em um cenário de desindustrialização e 
+#crescimento das cidades médias, as metrópoles mantêm em seus territórios elementos
+#que garantem seu poder de polarização e um lugar de destaque na hierarquia nacional 
+#(Mioto, Sugimoto, Trovão, 2020) se mostra fortalecida frente a esses dados.
+#   Nesse sentido, as categorias mais úteis para visualizar o terciário mais sofisticado
+#foram os Serviços intensivos em conhecimento de alta tecnologia, Serviços
+#financeiros intensivos em conhecimento e Serviços de mercado intensivos em conhecimento,
+#com uma elevada concentração devido a sua sofisticação.
+#   Neles, se destaca a maior concentração no Sudeste e Sul, particularmente
+# São Paulo, Rio de Janeiro e Belo Horizonte com um predomínio absoluto nas faixas 
+#superiores, e Curitiba como um destaque no Sul, mas com uma notável presença em municípios de outras regiões, como 
+#Manaus, Belem, Brasilia, Goiânia e Recife. Ainda assim, todos esses municípios
+#são capitais e municípios-polo de suas respectivas regiões metropolitanas.
+#   Portanto, essa pesquisa mostra um primeiro passo na direção de uma melhor
+#compreensão do terciário brasileiro. Mesmo com uma base de dados extensa
+#conseguimos baixar e tratar os dados diretamente. Assim, para futuras pesquisas
+#será possível elaborar outras metodologias para a compreensão de outros setores
+#como a indústria e o imobiliário. Evidentemente, ainda é necessário inúmeros
+#avanços nessa pesquisa do terciário, que serão desenvolvidos ao longo do tempo como:
+#   -Desenvolvimento de uma série histórica para acompanhar mudanças ao longo do tempo
+#(já que é possível ter uma noção do estado de uma empresa a partir de sua situação
+#cadastral, e, portanto, teoricamente é possivel historicizar os CNPjs até sua origem- 1891)
+#   -Desenvolvimento de pesquisas para uma compreensão mais regionalizada, visto
+#que é possível transformar os endereços em pontos no espaço e, portanto,
+#visualizar mudanças dentro dos municípios e, portanto, nas áreas de interesse do INCT
+#(as Regiões Metropolitanas de São Paulo, Rio de Janeiro, Belém, Recife, Goiânia e Curitiba)
+
+#===============================================================================
+#Referências
+#===============================================================================
+
+#BD. Base dos dados. Censo Demográfico, 2022.
+
+#MIOTO, B. T.; SUGIMOTO, T. N.; TROVÃO, C. J. B. M.. Região Metropolitana de São
+#Paulo: desempenho e inserção regional no período de 2006 a 2016. In: RIBEIRO, 
+#M. G.; CLEMENTINO, M.  L. M. (org.). Economia metropolitana e desenvolvimento 
+#regional: do experimento desenvolvimentista à inflexão ultraliberal. Rio de Janeiro: 
+#Letra Capital Editora, 2020. 
+
+#RF. Receita Federal. Cadastro Nacional de Pessoa Jurídica, 2025.
+
+#===============================================================================
+#Apêndice A
+#===============================================================================
+
+#Nesse Anexo se encontra o código em SQL para, a partir do BigQuery, criar uma tabela 
+#com as informações que utilizaremos. Assim:
+
+#SELECT
+#cnpj,
+#id_municipio,
+#id_municipio_nome,
+#id_municipio_rf
+#FROM (
+#  SELECT
+#  dados.cnpj as cnpj,
+# dados.id_municipio AS id_municipio,
+#  diretorio_id_municipio.nome AS id_municipio_nome,
+#  dados.id_municipio_rf as id_municipio_rf,
+# ROW_NUMBER() OVER(PARTITION BY dados.id_municipio ORDER BY dados.cnpj) as rn
+
+#  FROM
+# `basedosdados.br_me_cnpj.estabelecimentos` AS dados
+#LEFT JOIN
+#(SELECT DISTINCT id_municipio, nome FROM `basedosdados.br_bd_diretorios_brasil.municipio`) AS diretorio_id_municipio
+#ON
+#dados.id_municipio = diretorio_id_municipio.id_municipio
+#)
+#WHERE rn = 1 -- O LIMIT é aplicado após a seleção do "primeiro" por município
+
+#===============================================================================
+#Apêndice B
+#===============================================================================
+
+# --- ANÁLISE DA DISTRIBUIÇÃO DE num_estabelecimentos ---
+#A análise da distribuição é útil para gerar faixas que sejam condizentes com os dados
+#A análise será feita para criar faixas com mais estabelecimentos para essa
+#categoria específica. As categorias posteriores usarão essas faixas para garantir
+#que seja possível comparar os dados
+
+# 1. Resumo Estatístico Básico
+cat("\nResumo (Summary) de 'num_estabelecimentos':\n")
+print(summary(municipios_com_dados_mercado_mapa$num_estabelecimentos))
+
+# 2. Quantis (Percentis) - Muito útil para definir quebras
+cat("\nQuantis de 'num_estabelecimentos':\n")
+print(quantile(municipios_com_dados_mercado_mapa$num_estabelecimentos,
+               probs = c(0, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99, 1.0),
+               na.rm = TRUE))
+
+# 3. Contagem de Municípios com 0 Estabelecimentos
+cat("\nNúmero de municípios com 0 estabelecimentos:", sum(municipios_com_dados_mercado_mapa$num_estabelecimentos == 0), "\n")
+cat("Total de municípios no mapa:", nrow(municipios_com_dados_mercado_mapa), "\n")
+cat("Proporção de municípios com 0 estabelecimentos:",
+    round(sum(municipios_com_dados_mercado_mapa$num_estabelecimentos == 0) / nrow(municipios_com_dados_mercado_mapa) * 100, 2), "%\n")
+
+# 4. Amostra de Frequências para Valores Baixos (se não houver muitos únicos)
+# Se houver muitos municípios com poucos estabelecimentos, essa tabela será grande.
+# Apenas para valores <= 100, por exemplo.
+cat("\nFrequência para 'num_estabelecimentos' (valores <= 100, se existirem):\n")
+freq_table <- table(municipios_com_dados_mercado_mapa$num_estabelecimentos[municipios_com_dados_mercado_mapa$num_estabelecimentos <= 100])
+if(length(freq_table) > 0) {
+  print(freq_table)
+} else {
+  cat("Não há municípios com <= 100 estabelecimentos nesta categoria.\n")
+}
